@@ -1,0 +1,352 @@
+import matplotlib.pyplot as plt
+import pandas as pd
+import statsmodels.api as sm
+import numpy as np
+import seaborn as sns
+from scipy.stats import ttest_ind
+from sklearn.model_selection import train_test_split
+from sklearn.utils import resample
+from sklearn.metrics import mean_squared_error
+from matplotlib.ticker import FormatStrFormatter
+
+csfont = {'fontname':'Times New Roman','weight':'bold'}
+
+data = pd.read_excel('data.xlsx',sheet_name='data')
+datalog = pd.read_excel('data.xlsx',sheet_name='logged')
+df= pd.DataFrame(data)
+dfl= pd.DataFrame(datalog)
+
+#Functions
+def histogram(data):
+    n, bins, patches = plt.hist(x=data, bins='auto', color='#0504aa',
+                                alpha=0.7, rwidth=0.85)
+    plt.grid(axis='y', alpha=0.75)
+    plt.xlabel('Value')
+    plt.ylabel('Frequency')
+    plt.title('Histogram of '+ data.head(0))
+    maxfreq = n.max()
+    # Set a clean upper y-axis limit.
+    plt.ylim(ymax=np.ceil(maxfreq / 10) * 10 if maxfreq % 10 else maxfreq + 10)
+def average(lst):
+    return sum(lst) / len(lst)
+def variance(data, ddof=0):
+     n = len(data)
+     mean = sum(data) / n
+     return sum((x - mean) ** 2 for x in data) / (n - ddof)
+def stdev(data):
+     var = variance(data)
+     std_dev = (var**0.5)
+     return std_dev
+#NSE
+def nse(true,predictions):
+    return 1-(np.sum((true-predictions)**2)/np.sum((true-np.mean(predictions))**2))
+#P-value
+def calculate_pvalues(df):
+    df = df.dropna()._get_numeric_data()
+    dfcols = pd.DataFrame(columns=df.columns)
+    pvalues = dfcols.transpose().join(dfcols, how='outer')
+    for r in df.columns:
+        for c in df.columns:
+            pvalues[r][c] = ttest_ind(df[r], df[c],equal_var=False).pvalue
+    return pvalues
+#%%autocorrelation function
+
+# result=sm.tsa.acf(df['out_mean_m3/s'].sort_values(ascending=True), nlags=10)
+# fig1 = tsaplots.plot_acf(df['out_mean_m3/s'].sort_values(ascending=True), lags=32)
+ACresult=[]
+for i,col in enumerate(df.columns[2:]):
+    ACresult.append(sm.tsa.acf(df[col].sort_values(ascending=True), nlags=10))
+ac=pd.DataFrame(ACresult)
+ac.to_csv('ac.csv')
+# %%Generate histogram.
+histResult=[]
+for i, col in enumerate(df.columns[28:]):
+    plt.figure(i)
+    sns.set(font_scale=1.4)
+    df[col].plot(kind='hist',kde=True, figsize=(10, 10));
+    plt.xlabel(df.columns[i+2], labelpad=14)
+    plt.ylabel("Frequency", labelpad=14)
+    # %%stepwise regression Drop variables with p-value>0.05 one by one
+x_columns = dfl[['A','WTL']]
+y_columns = dfl['Q mean']
+x_columns = sm.add_constant(x_columns)
+reg=sm.OLS(y_columns, x_columns).fit()
+y_sim = reg.predict(x_columns)
+print(reg.summary())
+#%% Resampling
+#bootstrapping
+# partition data into training and test sets
+Coefficients=[]
+NSE_RSR=[]
+NSE_RSR_SD=[]
+AIC=[]
+for i,col in enumerate(dfl.columns[2:26]):
+    X = dfl[['A','P mean']]
+    y = dfl[col]
+    
+    # train model
+    # bootstrap predictions
+    coefs=[]
+    SDcoef=[]
+    CVcoef=[]
+    Pvals=[]
+    n_iterations = 1000
+    accuracy = []
+    accuracyVal = []
+    predicted=[]
+    aic=[]
+    for i in range(n_iterations):
+        x_train, x_test, y_train, y_test = train_test_split(X, y, train_size = 0.7)
+        # restructure data for input into model
+        group_train=pd.concat([x_train, y_train], join = 'outer', axis = 1)
+        group_test=pd.concat([x_test, y_test], join = 'outer', axis = 1)
+        
+        group_trainB=resample(group_train, replace=True,n_samples=70)
+        group_testB=resample(group_test, replace=True,n_samples=30)
+        X_obs, y_obs = group_trainB[['A','P mean']], group_trainB[col]
+        X_obst, y_obst = group_testB[['A','P mean']], group_testB[col]
+        # make predictions
+        X_obs = sm.add_constant(X_obs)
+        X_obst = sm.add_constant(X_obst)
+        reg=sm.OLS(y_obs, X_obs).fit() 
+        y_sim = reg.predict(X_obs)
+        y_simtest= reg.predict(X_obst)
+        coefs.append(reg.params)
+        Pvals.append(reg.pvalues)
+        
+        # evaluate model
+        mse_cal = mean_squared_error(y_obs, y_sim)
+        mse_val = mean_squared_error(y_obst, y_simtest)
+        nse_cal = nse(y_obs,y_sim)
+        rsr_cal=np.sqrt(mse_cal)/np.std(y_obs)
+        nse_val = nse(y_obst,y_simtest)
+        rsr_val=np.sqrt(mse_val)/np.std(y_obst)
+        aic_cal= np.log(mse_cal)+8/36
+        aic_val= np.log(mse_val)+8/36
+        accuracy.append([nse_cal,rsr_cal])
+        aic.append([aic_cal,aic_val])
+        accuracyVal.append([nse_val,rsr_val])
+    dacc = pd.DataFrame (accuracy, columns = ['NSE Calibration','RSR Calibration'])
+    dacv = pd.DataFrame (accuracyVal, columns = ['NSE validation','RSR validation'])
+    aic = pd.DataFrame (aic, columns = ['AIC Cal','AIC Val'])
+    dac=pd.concat([dacc,dacv],axis=1)
+    print('******************')
+    print('Train Size 70%',dfl[col].name)
+    print(dacc.mean())
+    print(dacv.mean())
+    AIC.append(aic.mean())
+    NSE_RSR.append(dac.mean())
+    NSE_RSR_SD.append(dac.std())
+    print('******************')
+    coef=average(coefs)
+    SDcoef=stdev(coefs)
+    Pval=average(Pvals)
+    Coefficient=np.append(coef,SDcoef)
+    Coefficient=np.append(Coefficient,Pval)
+    Coefficients.append(Coefficient)
+    predicted=coef[1]*X['A']+coef[2]*X['P mean']+coef[0]
+    residuals=y-predicted
+    # residual vs predicted fig log data
+    label = dfl[col].name
+    label, subscript = label.split(' ')
+
+    # Residuals plot
+    
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=500)
+    ax.scatter(predicted, residuals, facecolors='none', edgecolors='b')
+    ax.axhline(y=0, color='k', linestyle='--', lw=3)
+    ax.set_xlabel('Predicted (' + label + f"$_{{{subscript}}}$" + ')', fontsize=12, **csfont)
+    ax.set_ylabel('Residuals (' + label + f"$_{{{subscript}}}$" + ')', fontsize=12, **csfont)
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    ax.xaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+    ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+    plt.tight_layout()
+    
+    # Predicted vs Observed plot
+    fig, bx = plt.subplots(figsize=(8, 6), dpi=500)
+    bx.scatter(y, predicted, facecolors='none', edgecolors='b')
+    bx.plot([y.min(), y.max()], [y.min(), y.max()], 'k--', lw=3)
+    bx.set_xlabel('Log Observed ' + label + f"$_{{{subscript}}}$" + ' ($m^3/s$)', fontsize=12, **csfont)
+    bx.set_ylabel('Log Predicted ' + label + f"$_{{{subscript}}}$" + ' ($m^3/s$)', fontsize=12, **csfont)
+    bx.tick_params(axis='both', which='major', labelsize=12)
+    bx.xaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+    bx.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+    plt.tight_layout()
+
+   
+    # # Predicted vs Observed fig Original data
+    # yorig=10**y
+    # predictedorig=10**predicted
+    # fig, cx = plt.subplots(figsize=(6, 6),dpi=500)
+    # cx.scatter(yorig, predictedorig,facecolors='none', edgecolors='b')
+    # cx.plot([yorig.min(), yorig.max()], [yorig.min(), yorig.max()], 'k--', lw=3)
+    # cx.set_xlabel('Observed ' + label + f"$_{{{subscript}}}$"+' ($m^3/s$)',fontsize=12,**csfont)
+    # cx.set_ylabel('Predicted ' + label + f"$_{{{subscript}}}$"+' ($m^3/s$)',fontsize=12,**csfont)
+    # plt.xticks(fontsize=12)
+    # plt.yticks(fontsize=12)
+  
+Coefficients=pd.DataFrame(Coefficients,columns= ['beta0','beta1','beta2','SD0','SD1','SD2',
+                                    
+                                                 'PV0','PV1','PV2'])
+NSE_RSR=pd.DataFrame(NSE_RSR)
+NSE_RSR_SD=pd.DataFrame(NSE_RSR_SD)
+AIC=pd.DataFrame(AIC)
+#%%  PCA analyses 
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+def loading_plot(coeff, labels, highlight=None, split_columns=[]):
+    n = coeff.shape[0]
+    for i in range(n):
+        label = labels[i]
+        subscript = ''
+        if label in split_columns:
+            label, subscript = label.split(' ')
+        if i == highlight:
+            plt.arrow(0, 0, coeff[i,0], coeff[i,1], head_width=0, head_length=0, color='r')
+            # plt.text(coeff[i,0]*1.2, coeff[i,1]*1.15, label + f"$_{{{subscript}}}$", color='r', ha='center', va='center',fontsize=10,fontname='Times New Roman' )
+        else:
+            plt.arrow(0, 0, coeff[i,0], coeff[i,1], head_width=0, head_length=0, color='k',linewidth=0.4)
+            # plt.text(coeff[i,0]* 1.2, coeff[i,1]*1.15 , label + f"$_{{{subscript}}}$", color='k', ha='center', va='center',fontsize=10, fontname='Times New Roman')
+            
+    plt.xlim(-0.8, 0.8)
+    plt.ylim(-0.8, 0.8)
+    plt.xlabel('PC1 (51%)', fontsize=16, **csfont)
+    plt.ylabel('PC2 (14%)', fontsize=16, **csfont)
+    plt.grid()
+# this is standardization dataset with (mean=0, variance=1) scale
+factors=[]
+Evariance=[]
+scores=[]
+for i in range(25,26):
+    df_st =  StandardScaler().fit_transform(df.iloc[:,np.r_[i,26:44]])  #  34 44 for lc, 26,34 for PP
+    df_st=pd.DataFrame(df_st, columns=df.iloc[:,np.r_[i,26:44]].columns)
+    pca = PCA(n_components=19)
+    X = pca.fit_transform(df_st)
+    scores.append(X[:, :2]) # keep only first two PCs
+    # # save the scores to a CSV file
+    # filename = f"scores_{i-1}.csv"
+    # pd.DataFrame(X, columns=[f"PC{j}" for j in range(1,12)]).to_csv(filename, index=True)
+    # component loadings or weights (correlation coefficient between original variables and the component) 
+    # the squared loadings within the PCs always sums to 1
+    loadings = pd.DataFrame(pca.components_.T, columns=[f"PC{j}" for j in range(1,20)], index=df_st.columns.values)
+    loadings.loc['Evariance'] = 100*pca.explained_variance_ratio_
+    factors.append(loadings)
+    # save the factor to a CSV file
+    # filename = f"factor_{i-1}.csv"
+    # loadings.to_csv(filename, index=True)
+    # scatter plot of PC1 and PC2 scores
+    # fig, ax = plt.subplots(dpi=300)
+    # ax.scatter(X[:, 0], X[:, 1])
+    # ax.set_xlabel('PC1', fontsize=12)
+    # ax.set_ylabel('PC2', fontsize=12)
+    # ax.grid()
+    
+    
+    fig, ex = plt.subplots(figsize=(7, 6),dpi=500)
+    ex.grid(which='major', linestyle='-', linewidth='0.5', color='gray')
+    ex.axhline(0, color='black',linestyle='--',linewidth='0.5')
+    ex.axvline(0, color='black',linestyle='--',linewidth='0.5')
+    ex.spines['top'].set_color('None')
+    ex.spines['right'].set_color('None')
+    # set the positions and labels for the x-axis ticks
+    ex.set_xticks([-0.6, 0, 0.6])
+    ex.set_xticklabels([-0.6, 0, 0.6],fontsize=14) 
+    
+    # set the positions and labels for the y-axis ticks
+    ex.set_yticks([-0.6, 0, 0.6])
+    ex.set_yticklabels([-0.6, 0, 0.6],fontsize=14)
+    # set the xticklabels to bold
+    for label in ex.get_xticklabels():
+        label.set_weight('bold')
+    # set the yticklabels to bold
+    for label in ex.get_yticklabels():
+        label.set_weight('bold')
+    split_columns = df.columns[:32] # pass the column names that you want to split
+    loading_plot(pca.components_.T, df_st.columns.values, highlight=0, split_columns=split_columns)
+#%%  QQplot 
+for i,col in enumerate(df.columns[2:42]):
+    sm.qqplot(dfl[col],line ='45',xlabel='Theoritical quantile '+dfl[col].name)
+    plt.savefig('plot'+str(i)+'.png',dpi=500)
+#%%P value, correlation of parameters (X,y)
+pv=calculate_pvalues(df[2:]) 
+pv.to_csv('pvalue.csv')
+corre = df[2:].corr(method='pearson')
+corre.to_csv('correlation.csv')
+#%%  parallel plot
+import matplotlib.pyplot as plt
+import numpy as np
+
+# define the equation for Q as a function of A and P
+def q_func(A, P):
+    
+    return 10**-1.71*A**0.93 * P**0.235129527747408
+
+## define the range of A values to plot
+A_vals = np.linspace(0, 20000, 50)
+
+# define a list of constant values of P to plot
+P_vals = [1, 5, 13,25,50,75,100,150,200,300,500,400,600,800]
+
+# define a list of colors to use for each series
+colors = ['black', 'darkblue','navy', 'dodgerblue', 'blue', 'darkgreen','green','darkorange', 'orange', 'violet', 'magenta','deeppink','pink', 'crimson']
+# create a scatter plot with multiple series
+fig, ax = plt.subplots(figsize=(8, 6), dpi=500)
+for i, P in enumerate(P_vals):
+    Q_vals = q_func(A_vals, P)
+    ax.plot(A_vals, Q_vals, label=r'$P = {}$ mm/day'.format(P), color=colors[i])
+
+# set axis labels and title with superscripts
+ax.set_xlabel('Area (km$^2$)',fontsize=15,fontname='Times New Roman')
+ax.set_ylabel('Streamflow (m$^3$/s)')
+# ax.set_title('Streamflow vs Area for different precipitation values')
+
+# add a legend
+ax.legend()
+
+# display the plot
+plt.show()
+#%%  parallel plot
+import matplotlib.pyplot as plt
+import numpy as np
+
+# define the equation for Q as a function of A and P
+def q_func(A, P):
+    
+    return 10**-2.12*A**0.95 * P**0.33
+
+## define the range of A values to plot
+A_vals = np.linspace(0, 20000, 50)
+
+# define a list of constant values of P to plot
+P_vals = [1, 5, 13,25,50,100,200,400,800]
+
+# define a list of colors to use for each series
+colors = ['black', 'darkblue', 'dodgerblue', 'blue', 'darkgreen', 'orange', 'violet', 'deeppink', 'crimson']
+# create a scatter plot with multiple series
+fig, ax = plt.subplots(figsize=(8, 6), dpi=500)
+for i, P in enumerate(P_vals):
+    Q_vals = q_func(A_vals, P)
+    ax.plot(A_vals, Q_vals, label=r'$P = {}$ mm/day'.format(P), color=colors[i])
+
+# set axis labels and title with superscripts
+ax.set_xlabel('Area (km$^2$)',fontsize=15,fontname='Times New Roman')
+ax.set_ylabel('Median Streamflow (m$^3$/s)',fontsize=15,fontname='Times New Roman')
+# ax.set_title('Streamflow vs Area for different precipitation values')
+
+# add a legend
+ax.legend()
+
+# display the plot
+plt.show()
+#%%  PDF of parameters (X,y) plot
+for i in range(2,44):
+    dx = sns.histplot(data=(dfl.iloc[:,i]),
+                      bins='auto',
+                      kde=True,
+                      color='k'
+                      )
+    sns.set(rc={"figure.dpi":500})
+    dx.set(xlabel='Values of '+ str(dfl.columns[i]), ylabel='Density')
+
+    plt.show()
